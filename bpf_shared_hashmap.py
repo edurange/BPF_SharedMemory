@@ -1,8 +1,3 @@
-import importlib.util
-spec = importlib.util.spec_from_file_location("pybst", "/VENV/lib/python3.12/site-packages/pybst/__init__.py")
-pybst = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(pybst)
-
 from ctypes import Structure, c_uint
 from bcc import BPF
 from pybst.avltree import AVLTree
