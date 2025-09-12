@@ -1,3 +1,5 @@
+"""Nests a binary search tree inside of a hashmap, and then shares it between a bcc.bpf kernel space and a python userspace"""
+
 from ctypes import Structure, c_uint
 from bcc import BPF
 from pybst.avltree import AVLTree
