@@ -1,15 +1,14 @@
-"""Nests a binary search tree inside of a hashmap, and then shares it between a bcc.bpf kernel space and a python userspace"""
+"""Initializes a hashmap containing a BST in kernel space and shares it with user space"""
 
-from ctypes import Structure, c_uint
-from bcc import BPF
-from pybst.avltree import AVLTree
-# from pybst.bstnode import BSTNode
 import ctypes as ct
+from ctypes import Structure, c_uint
+import os
+from bcc import BPF
 
 class Node(Structure):
     _fields_ = [
-        ("data", c_uint),
-        ("left_key", c_uint),
+        ("data", c_uint), 
+        ("left_key", c_uint), 
         ("right_key", c_uint)
     ]
 
@@ -23,149 +22,89 @@ struct Node {
 };
 
 BPF_HASH(shared_memory, u32, struct Node);
+BPF_ARRAY(key_map, u32, 1);
+BPF_PERF_OUTPUT(events);
 
-
-BPF_PERF_OUTPUT(search_events);
-struct search_result_t {
-    u32 value;
-    u32 found;
-};
-
-int search_tree(u32 search_value) {
-    u32 root_key = 1;
-    u32 current_key = root_key;
+int read_node_data(struct pt_regs *ctx) {
+    u32 index = 0;
+    u32 *node_key_ptr = key_map.lookup(&index);
+    if (!node_key_ptr) return 0;
     
-    while (current_key != 0) {
-        struct Node *current_node = shared_memory.lookup(&current_key);
-        if (!current_node) {
-            break;  // Node not found
-        }
-        
-        if (current_node->data == search_value) {
-            return 1;  // Value found
-        } else if (search_value < current_node->data) {
-            current_key = current_node->left_key;
-        } else {
-            current_key = current_node->right_key;
-        }
+    u32 node_key = *node_key_ptr;
+    struct Node *node = shared_memory.lookup(&node_key);
+    if (node) {
+        u32 data = node->data;
+        events.perf_submit(ctx, &data, sizeof(data));
+        return 1;
     }
-    
-    return 0;  // Value not found
-}
-
-int trace_search(struct pt_regs *ctx, u32 search_value) {
-    struct search_result_t result = {};
-    result.value = search_value;
-    result.found = search_tree(search_value);
-    
-    search_events.perf_submit(ctx, &result, sizeof(result));
     return 0;
 }
 """
 
+# Initialize BPF
 b = BPF(text=bpf_text, cflags=["-Wno-duplicate-decl-specifier"])
-shared_memory = b.get_table("shared_memory")
+b.attach_tracepoint(tp=b"syscalls:sys_enter_getpid", fn_name=b"read_node_data")
 
-b.attach_kprobe(event="sys_getpid", fn_name="trace_search")
-
-class SearchResult(ct.Structure):
-    _fields_ = [
-        ("value", ct.c_uint),
-        ("found", ct.c_uint)
-    ]
-def print_search_event(cpu, data, size):
-
-    event = ct.cast(data, ct.POINTER(SearchResult)).contents
-    print(f"Search for {event.value}: {'Found' if event.found else 'Not found'}")
-
-b["search_events"].open_perf_buffer(print_search_event)
-
-class BPFAVLTree:
+class BPFHashManager:
     def __init__(self):
-        self.avl_tree = AVLTree()
         self.key_counter = 1
-        self.node_map = {}
-
-    def insert(self, data):
-        node = self.avl_tree.insert(data)
+        self.key_map = b.get_table("key_map")
+        self.shared_memory = b.get_table("shared_memory")
+    
+    def insert(self, data, left_key=0, right_key=0):
         node_key = self.key_counter
         self.key_counter += 1
-        self.node_map[node] = node_key
-        self._update_bpf_tree()
-        return node
-
-    def _update_bpf_tree(self):
-        if self.avl_tree.root:
-            self._update_node_in_bpf(self.avl_tree.root)
-
-    def _update_node_in_bpf(self, node):
-        if not node:
-            return 0
-
-        if node in self.node_map:
-            node_key = self.node_map[node]
-        else:
-            node_key = self.key_counter
-            self.key_counter += 1
-            self.node_map[node] = node_key
-
-        left_key = self._update_node_in_bpf(node.left) if node.left else 0
-        right_key = self._update_node_in_bpf(node.right) if node.right else 0
-        bpf_node = Node(data=node.key, left_key=left_key, right_key=right_key)
-        
-        shared_memory[c_uint(node_key)] = bpf_node
+        bpf_node = Node(data=data, left_key=left_key, right_key=right_key)
+        self.shared_memory[ct.c_uint(node_key)] = bpf_node
         return node_key
     
-    def print_tree(self):
-        print("AVL Tree:")
-        self._print_tree(self.avl_tree.root)
-        print("\nBPF Hash Map Contents:")
-        for key, node in shared_memory.items(): # type: ignore
+    def print_hashmap(self):
+        print("BPF Hash Map Contents:")
+        for key, node in self.shared_memory.items():
             print(f"Key: {key.value}, Data: {node.data}, Left: {node.left_key}, Right: {node.right_key}")
-
-    def _print_tree(self, node, level=0, prefix="Root: "):
-        if node is not None:
-            print(" " * (level * 4) + prefix + str(node.key))
-            if node.left or node.right:
-                if node.left:
-                    self._print_tree(node.left, level + 1, "L--- ")
-                else:
-                    print(" " * ((level + 1) * 4) + "L--- None")
-                if node.right:
-                    self._print_tree(node.right, level + 1, "R--- ")
-                else:
-                    print(" " * ((level + 1) * 4) + "R--- None")
-
-    def search(self, value):
-        # Trigger the BPF search function by calling getpid (which triggers our kprobe) not ideal for realtime lookup
-        import os
+    
+    def trigger_read(self, node_key):
+        self.key_map[ct.c_int(0)] = ct.c_uint(node_key)
         os.getpid()
-        b.perf_buffer_poll()
+        b.perf_buffer_poll(timeout=100)
+
+def print_event(cpu, data, size):
+    result = ct.cast(data, ct.POINTER(ct.c_uint)).contents
+    print(f"Data read from BPF: {result.value}")
+
+b["events"].open_perf_buffer(print_event)
 
 # Example usage
 if __name__ == "__main__":
-    # Create AVL tree
-    avl_tree = BPFAVLTree()
+    manager = BPFHashManager()
+
+    # Build a tree
+    root_key = manager.insert(50)
+    left_key = manager.insert(30, right_key=manager.insert(40))
+    right_key = manager.insert(70, left_key=manager.insert(60))
     
-    # Insert values
-    values = [10, 20, 30, 40, 50, 25]
-    for val in values:
-        print(f"Inserting {val}")
-        avl_tree.insert(val)
-        avl_tree.print_tree()
-        print("-" * 40)
+    # Update root with references to children
+    root_node = Node(data=50, left_key=left_key, right_key=right_key)
+    manager.shared_memory[ct.c_uint(root_key)] = root_node
     
-    # Verify the tree is balanced (python)
-    print("Final tree structure:")
-    avl_tree.print_tree()
+    # Print the hashmap contents from userspace
+    manager.print_hashmap()
     
-    # Verify BPF hash map contents (python)
-    print("\nFinal BPF hash map:")
-    for key, node in shared_memory.items(): # type: ignore
-        print(f"Key: {key.value}, Data: {node.data}, Left: {node.left_key}, Right: {node.right_key}")
+    print("\n=== Demonstrating function calls in C ===")
     
-    # Perform searches in kernel
-    print("Searching for values in tree:")
-    for val in [10, 15, 20, 25, 100]:
-        print(f"Searching for {val}...")
-        avl_tree.search(val)
+    print("\n1. Reading root node:")
+    manager.trigger_read(root_key)
+    
+    print("\n2. Reading left child:")
+    manager.trigger_read(left_key)
+    
+    print("\n3. Reading right child:")
+    manager.trigger_read(right_key)
+    
+    print("\n4. Reading a non-existent node:")
+    manager.trigger_read(99)
+
+"""
+the key_map array will be replaced with ring buffer functionality in the final implementation
+tree sorting is also not yet implemented
+"""
